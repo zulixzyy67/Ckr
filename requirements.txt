@@ -1,34 +1,5 @@
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  NullTrace Bot v50  —  requirements.txt                      ║
-# ║  Railway deployment (Python 3.13 compatible)                 ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-# ── Telegram bot framework ────────────────────────────────────────
-python-telegram-bot[webhooks]==21.4
-
-# ── HTTP clients ──────────────────────────────────────────────────
-requests==2.32.3
-aiohttp==3.10.5
-httpx[http2]==0.27.2
-
-# ── HTML parsing ──────────────────────────────────────────────────
+python-telegram-bot==21.3
+aiohttp==3.9.5
+aiohttp-socks==0.8.4
 beautifulsoup4==4.12.3
-lxml==5.3.0
-
-# ── Async + utilities ─────────────────────────────────────────────
-aiofiles==24.1.0
-uvloop==0.21.0                        # 0.21.0+ = Python 3.13 compatible (0.20.0 မသုံးပါနဲ့)
-
-# ── DNS / network ─────────────────────────────────────────────────
-dnspython==2.6.1
-
-# ── System monitoring ─────────────────────────────────────────────
-psutil==6.0.0
-
-# ── Environment ───────────────────────────────────────────────────
-python-dotenv==1.0.1
-
-# ── urllib3 ───────────────────────────────────────────────────────
-urllib3==2.2.2
-
-curl_cffi==0.14.0
+lxml==5.2.2
